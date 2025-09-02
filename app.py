@@ -2,21 +2,23 @@ import os, time, imaplib, email, re, sys, json, pathlib
 import requests
 from bs4 import BeautifulSoup
 
+# ---------- Config via env ----------
 IMAP_SERVER      = os.getenv("IMAP_SERVER", "imap.gmail.com")
 EMAIL_ACCOUNT    = os.getenv("EMAIL_ACCOUNT")                # e.g. you@gmail.com
-EMAIL_PASSWORD   = os.getenv("EMAIL_PASSWORD")               # 16-char Google App Password
+EMAIL_PASSWORD   = os.getenv("EMAIL_PASSWORD")               # 16-char Google App Password (no spaces)
 IMAP_FOLDER      = os.getenv("IMAP_FOLDER", "INBOX")
-# Default: any Wix mail that mentions payment/order/invoice in subject
 IMAP_SEARCH      = os.getenv("IMAP_SEARCH", '(FROM "@wix.com")')
 SUBJECT_KEYWORDS = os.getenv("SUBJECT_KEYWORDS", "payment,invoice,order").lower().split(",")
 POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "60"))
 MAX_EMAILS       = int(os.getenv("MAX_EMAILS_PER_RUN", "20"))
+DEBUG_PREVIEW    = os.getenv("DEBUG_PREVIEW", "0") == "1"    # set to 1 to print body preview in logs
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")            # @channel or -100123...
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")            # @channel or -100...
 
 STATE_PATH       = os.getenv("STATE_PATH", "/tmp/last_uid.json")
 
+# ---------- Utils ----------
 def log(*args):
     print(*args, flush=True)
 
@@ -39,15 +41,13 @@ def clean_html_to_text(html):
         return html
 
 def extract_plaintext(msg):
-    # Prefer text/plain, fallback to text/html
+    """Prefer text/plain; fallback to text/html converted to text."""
     if msg.is_multipart():
         for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype == "text/plain":
+            if part.get_content_type() == "text/plain":
                 return part.get_payload(decode=True).decode(errors="ignore")
         for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype == "text/html":
+            if part.get_content_type() == "text/html":
                 html = part.get_payload(decode=True).decode(errors="ignore")
                 return clean_html_to_text(html)
     else:
@@ -59,22 +59,60 @@ def extract_plaintext(msg):
                 return str(payload)
     return ""
 
-# Simple regex helpers – tweak to match your Wix email template if needed
-NAME_RE   = re.compile(r"(?im)^(?:Customer|Customer Name|Name)\s*:\s*(.+)$")
-EMAIL_RE  = re.compile(r"(?im)^[Ee]mail\s*:\s*([^\s]+@[^\s]+)")
-AMOUNT_RE = re.compile(r"(?im)^(?:Amount|Total)\s*:\s*([A-Z]{3}|USD)?\s*\$?([0-9,]+(?:\.[0-9]{2})?)")
+# ---------- Robust field extraction ----------
+# Label-based patterns (highest quality)
+NAME_LABEL_RE = re.compile(r"(?im)^(?:Customer(?: Name)?|Buyer|Billing name|Recipient|Name)\s*[:\-]\s*(.+)$")
+EMAIL_LABEL_RE = re.compile(r"(?im)^[\w\s]*email[\w\s]*[:\-]\s*([^\s<>\)]+@[^\s<>\)]+)")
+AMOUNT_LABEL_RE = re.compile(
+    r"(?im)^(?:Amount(?:\s*paid)?|Payment amount|Charged|Total(?:\s*paid)?)\s*[:\-]?\s*(?:USD|US\$|EUR|€|GBP|£|\$)?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"
+)
 
-def parse_fields(text):
-    name   = (NAME_RE.search(text) or (None,))[0] if NAME_RE.search(text) else None
-    email_ = (EMAIL_RE.search(text) or (None,))[0] if EMAIL_RE.search(text) else None
-    amt_m  = AMOUNT_RE.search(text)
+# Generic fallbacks
+ANY_EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+ANY_CURRENCY_NUMBER_RE = re.compile(r"(?:USD|US\$|EUR|€|GBP|£|\$)\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)")
+
+def _guess_currency(s: str) -> str:
+    s = s.upper()
+    if "€" in s or "EUR" in s: return "EUR"
+    if "£" in s or "GBP" in s: return "GBP"
+    return "USD"  # default for most Wix US emails
+
+def parse_fields(text: str):
+    """Try labeled lines first; then fall back to best guesses."""
+    name = None
+    email_ = None
     amount = None
-    if amt_m:
-        ccy = amt_m.group(1) or "USD"
-        val = amt_m.group(2)
-        amount = f"{ccy} {val}".strip()
+
+    m = NAME_LABEL_RE.search(text)
+    if m:
+        name = m.group(1).strip()
+
+    m = EMAIL_LABEL_RE.search(text)
+    if m:
+        email_ = m.group(1).strip()
+    else:
+        m2 = ANY_EMAIL_RE.search(text)
+        if m2:
+            email_ = m2.group(0)
+
+    m = AMOUNT_LABEL_RE.search(text)
+    if m:
+        val = m.group(1)
+        line = m.group(0)
+        ccy = _guess_currency(line)
+        amount = f"{ccy} {val}"
+    else:
+        candidates = [x.replace(",", "") for x in ANY_CURRENCY_NUMBER_RE.findall(text)]
+        if candidates:
+            try:
+                val = max(float(v) for v in candidates)
+                amount = f"USD {val:,.2f}"
+            except Exception:
+                pass
+
     return name, email_, amount
 
+# ---------- State ----------
 def load_last_uid():
     p = pathlib.Path(STATE_PATH)
     if p.exists():
@@ -92,11 +130,13 @@ def subject_matches(subject: str) -> bool:
     s = (subject or "").lower()
     return any(k.strip() and k.strip() in s for k in SUBJECT_KEYWORDS)
 
+# ---------- Main poller ----------
 def run_once():
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
     mail.select(IMAP_FOLDER)
-    # Use UID so we can keep state safely
+
+    # Use UID search so we can track "last processed" safely.
     typ, data = mail.uid("SEARCH", None, IMAP_SEARCH)
     if typ != "OK":
         log("IMAP search failed:", data)
@@ -110,27 +150,30 @@ def run_once():
     last_seen = load_last_uid()
     new_uids = [u for u in uids if u > last_seen]
     if not new_uids:
-        log("No new emails since UID", last_seen)
+        log(f"No new emails since UID {last_seen}")
         return
 
-    # only process a limited batch per run
     new_uids.sort()
-    batch = new_uids[-MAX_EMAILS:]
+    batch = new_uids[-MAX_EMAILS:]  # limit per run
 
     latest = last_seen
     for uid in batch:
         typ, msg_data = mail.uid("FETCH", str(uid), "(RFC822)")
         if typ != "OK" or not msg_data or not msg_data[0]:
             continue
+
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
 
         subject = msg.get("subject", "")
         if not subject_matches(subject):
-            # skip non-payment subjects even if from wix
+            # Skip non-paymenty subjects, even if the sender matches
             continue
 
         body = extract_plaintext(msg)
+        if DEBUG_PREVIEW:
+            log("Body preview:", body[:400].replace("\n", " ")[:400])
+
         name, email_addr, amount = parse_fields(body)
 
         pretty = (
@@ -146,12 +189,18 @@ def run_once():
         log(f"Sent UID {uid}: {ok}")
         latest = max(latest, uid)
 
-    # persist last processed UID
     save_last_uid(latest)
 
 def main_loop():
-    if not all([EMAIL_ACCOUNT, EMAIL_PASSWORD, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-        log("❗ Missing one or more required env vars: EMAIL_ACCOUNT, EMAIL_PASSWORD, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+    # Sanity checks
+    missing = [k for k, v in {
+        "EMAIL_ACCOUNT": EMAIL_ACCOUNT,
+        "EMAIL_PASSWORD": EMAIL_PASSWORD,
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    }.items() if not v]
+    if missing:
+        log("❗ Missing required env vars:", ", ".join(missing))
         sys.exit(1)
 
     log("Worker started. Polling every", POLL_SECONDS, "seconds")
