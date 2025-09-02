@@ -1,9 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: wix-email-to-telegram
     env: python
     plan: free
-    startCommand: "python app.py"
+    runtime: python
+    startCommand: "gunicorn web:app --preload"
     autoDeploy: true
     envVars:
       - key: IMAP_SERVER
@@ -16,7 +17,6 @@ services:
         value: payment,invoice,order
       - key: POLL_SECONDS
         value: "60"
-      # Fill these four in the Render dashboard (recommended) or here if you prefer:
       - key: EMAIL_ACCOUNT
         sync: false
       - key: EMAIL_PASSWORD
