@@ -3,8 +3,8 @@ import requests
 from bs4 import BeautifulSoup
 
 IMAP_SERVER      = os.getenv("IMAP_SERVER", "imap.gmail.com")
-EMAIL_ACCOUNT    = os.getenv("Wade@hts20.net")                # e.g. you@gmail.com
-EMAIL_PASSWORD   = os.getenv("yyeczppltbllqdor")               # 16-char Google App Password
+EMAIL_ACCOUNT    = os.getenv("EMAIL_ACCOUNT")                # e.g. you@gmail.com
+EMAIL_PASSWORD   = os.getenv("EMAIL_PASSWORD")               # 16-char Google App Password
 IMAP_FOLDER      = os.getenv("IMAP_FOLDER", "INBOX")
 # Default: any Wix mail that mentions payment/order/invoice in subject
 IMAP_SEARCH      = os.getenv("IMAP_SEARCH", '(FROM "@wix.com")')
@@ -12,8 +12,8 @@ SUBJECT_KEYWORDS = os.getenv("SUBJECT_KEYWORDS", "payment,invoice,order").lower(
 POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "60"))
 MAX_EMAILS       = int(os.getenv("MAX_EMAILS_PER_RUN", "20"))
 
-TELEGRAM_TOKEN   = os.getenv("7248196281:AAE0ejaQ-28wGUJ1TPww5AkT7BsjKYNBNQw")
-TELEGRAM_CHAT_ID = os.getenv("-1002760883437")            # @channel or -100123...
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")            # @channel or -100123...
 
 STATE_PATH       = os.getenv("STATE_PATH", "/tmp/last_uid.json")
 
