@@ -1,5 +1,3 @@
-# web.py
-import os
 from threading import Thread
 from flask import Flask, jsonify
 from app import main_loop
@@ -7,14 +5,12 @@ from app import main_loop
 app = Flask(__name__)
 
 def _run_worker():
-    # runs your IMAP → Telegram loop forever
-    main_loop()
+    main_loop()  # background IMAP→Telegram loop
 
-@app.route("/")
-def health():
-    return jsonify({"ok": True}), 200
-
-# When gunicorn imports this module, we start the worker thread.
-# Gunicorn will serve the Flask app; the thread runs the email poller.
+# Start the worker thread when the web app starts
 worker_thread = Thread(target=_run_worker, daemon=True)
 worker_thread.start()
+
+@app.get("/")
+def health():
+    return jsonify({"ok": True}), 200
