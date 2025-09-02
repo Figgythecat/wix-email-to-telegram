@@ -3,25 +3,29 @@ import requests
 from bs4 import BeautifulSoup
 
 # ---------- Config via env ----------
-IMAP_SERVER      = os.getenv("IMAP_SERVER", "imap.gmail.com")
-EMAIL_ACCOUNT    = os.getenv("EMAIL_ACCOUNT")
-EMAIL_PASSWORD   = os.getenv("EMAIL_PASSWORD")               # Google App Password (no spaces)
-IMAP_FOLDER      = os.getenv("IMAP_FOLDER", "INBOX")
-IMAP_SEARCH      = os.getenv("IMAP_SEARCH", '(FROM "@wix.com")')
-SUBJECT_KEYWORDS = os.getenv("SUBJECT_KEYWORDS", "payment,invoice,order").lower().split(",")
-POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "60"))
-MAX_EMAILS       = int(os.getenv("MAX_EMAILS_PER_RUN", "20"))
-DEBUG_PREVIEW    = os.getenv("DEBUG_PREVIEW", "0") == "1"
+IMAP_SERVER       = os.getenv("IMAP_SERVER", "imap.gmail.com")
+EMAIL_ACCOUNT     = os.getenv("EMAIL_ACCOUNT")
+EMAIL_PASSWORD    = os.getenv("EMAIL_PASSWORD")          # Google App Password (no spaces)
+IMAP_FOLDER       = os.getenv("IMAP_FOLDER", "INBOX")
+IMAP_SEARCH_RAW   = os.getenv("IMAP_SEARCH", 'FROM "@wix.com"')  # IMAP search atoms (no parentheses)
+SUBJECT_KEYWORDS  = os.getenv("SUBJECT_KEYWORDS", "payment,invoice,order").lower().split(",")
+POLL_SECONDS      = int(os.getenv("POLL_SECONDS", "60"))
+MAX_EMAILS        = int(os.getenv("MAX_EMAILS_PER_RUN", "20"))
 
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DEBUG_PREVIEW     = os.getenv("DEBUG_PREVIEW", "0") == "1"
+IMAP_USE_UNSEEN   = os.getenv("IMAP_USE_UNSEEN", "0") == "1"     # add UNSEEN to search
+MARK_SEEN         = os.getenv("MARK_SEEN", "1") == "1"           # mark processed messages as Seen
+PROCESSED_LABEL   = os.getenv("PROCESSED_LABEL", "WixProcessed") # Gmail-only label for processed mail
 
-STATE_PATH       = os.getenv("STATE_PATH", "/tmp/last_uid.json")
-ALLOWED_FROM     = [d.strip().lower() for d in os.getenv("ALLOWED_FROM_DOMAINS", "wix.com").split(",") if d.strip()]
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
+
+STATE_PATH        = os.getenv("STATE_PATH", "/tmp/last_uid.json")
+RESET_STATE       = os.getenv("RESET_STATE", "0") == "1"         # set to 1 to ignore saved UID once
+ALLOWED_FROM      = [d.strip().lower() for d in os.getenv("ALLOWED_FROM_DOMAINS", "wix.com").split(",") if d.strip()]
 
 # ---------- Utils ----------
-def log(*args):
-    print(*args, flush=True)
+def log(*args): print(*args, flush=True)
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -37,11 +41,9 @@ def send_telegram(text):
 def clean_html_to_text(html):
     try:
         soup = BeautifulSoup(html, "html.parser")
-        for el in soup(["script", "style", "noscript"]):
-            el.extract()
+        for el in soup(["script", "style", "noscript"]): el.extract()
         text = soup.get_text("\n", strip=True)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text
+        return re.sub(r"\n{3,}", "\n\n", text)
     except Exception:
         return html
 
@@ -51,7 +53,7 @@ def extract_plaintext(msg):
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
                 continue
-            ctype  = part.get_content_type()
+            ctype = part.get_content_type()
             payload = part.get_payload(decode=True)
             if payload is None:
                 continue
@@ -85,9 +87,7 @@ def _guess_currency(s: str) -> str:
     return "USD"
 
 def parse_fields(text: str):
-    name = None
-    email_ = None
-    amount = None
+    name = None; email_ = None; amount = None
 
     m = NAME_LABEL_RE.search(text)
     if m: name = m.group(1).strip()
@@ -116,6 +116,8 @@ def parse_fields(text: str):
 
 # ---------- State ----------
 def load_last_uid():
+    if RESET_STATE:
+        return 0
     p = pathlib.Path(STATE_PATH)
     if p.exists():
         try:
@@ -125,8 +127,7 @@ def load_last_uid():
     return 0
 
 def save_last_uid(uid):
-    p = pathlib.Path(STATE_PATH)
-    p.write_text(json.dumps({"last_uid": uid}))
+    pathlib.Path(STATE_PATH).write_text(json.dumps({"last_uid": uid}))
 
 def subject_matches(subject: str) -> bool:
     s = (subject or "").lower()
@@ -136,20 +137,33 @@ def from_allowed(msg) -> bool:
     frm = (msg.get("from") or "").lower()
     return any(dom and dom in frm for dom in ALLOWED_FROM) if ALLOWED_FROM else True
 
+# ---------- Build IMAP SEARCH safely ----------
+def build_search_atoms():
+    atoms = []
+    if IMAP_USE_UNSEEN:
+        atoms += ["UNSEEN"]
+    # IMAP_SEARCH_RAW should be something like: 'FROM "@wix.com"' or 'SUBJECT "payment"'
+    # Split only on spaces that are not inside quotes
+    parts = re.findall(r'"[^"]*"|\S+', IMAP_SEARCH_RAW.strip())
+    atoms += parts
+    return atoms
+
 # ---------- Main poller ----------
 def run_once():
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
     mail.select(IMAP_FOLDER)
 
-    typ, data = mail.uid("SEARCH", None, IMAP_SEARCH)
+    atoms = build_search_atoms()
+    log("IMAP SEARCH:", " ".join(atoms))
+    typ, data = mail.uid("SEARCH", None, *atoms)
     if typ != "OK":
         log("IMAP search failed:", data)
         return
 
-    uids = [int(x) for x in data[0].split()] if data and data[0] else []
+    uids = [int(x) for x in (data[0].split() if data and data[0] else [])]
+    log("Found", len(uids), "matching emails.")
     if not uids:
-        log("No matching emails.")
         return
 
     last_seen = load_last_uid()
@@ -175,6 +189,9 @@ def run_once():
 
         subject = msg.get("subject", "")
         if not subject_matches(subject):
+            # If using UNSEEN, mark as seen so it doesn’t loop forever on non-matching mail
+            if IMAP_USE_UNSEEN and MARK_SEEN:
+                mail.uid("STORE", str(uid), "+FLAGS", r"(\Seen)")
             continue
 
         body = extract_plaintext(msg)
@@ -194,9 +211,19 @@ def run_once():
         )
         ok = send_telegram(pretty)
         log(f"Sent UID {uid}: {ok}")
+
+        if MARK_SEEN:
+            try:
+                mail.uid("STORE", str(uid), "+FLAGS", r"(\Seen)")
+                mail.uid("STORE", str(uid), "+X-GM-LABELS", f"({PROCESSED_LABEL})")
+            except Exception:
+                pass
+
         latest = max(latest, uid)
 
     save_last_uid(latest)
+    try: mail.logout()
+    except Exception: pass
 
 def main_loop():
     missing = [k for k, v in {
@@ -215,6 +242,8 @@ def main_loop():
             run_once()
         except Exception as e:
             log("Error:", repr(e))
+            try: send_telegram(f"⚠️ Worker error: {repr(e)}")
+            except Exception: pass
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
