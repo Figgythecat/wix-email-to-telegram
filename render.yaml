@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: wix-email-to-telegram
+    env: python
+    plan: free
+    startCommand: "python app.py"
+    autoDeploy: true
+    envVars:
+      - key: IMAP_SERVER
+        value: imap.gmail.com
+      - key: IMAP_FOLDER
+        value: INBOX
+      - key: IMAP_SEARCH
+        value: '(FROM "@wix.com")'
+      - key: SUBJECT_KEYWORDS
+        value: payment,invoice,order
+      - key: POLL_SECONDS
+        value: "60"
+      # Fill these four in the Render dashboard (recommended) or here if you prefer:
+      - key: EMAIL_ACCOUNT
+        sync: false
+      - key: EMAIL_PASSWORD
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
